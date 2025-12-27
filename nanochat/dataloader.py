@@ -1,7 +1,8 @@
 from collections import deque
+import json
+import gzip
 
 import torch
-import pyarrow.parquet as pq
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
@@ -9,7 +10,7 @@ from nanochat.tokenizer import get_tokenizer
 
 def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
     """
-    Stream pretraining text from parquet files, tokenize, yield training batches.
+    Stream pretraining text from jsonl files, tokenize, yield training batches.
 
     This implementation became a bit more complex because we wish to support approximate resume training.
     Instead of turning this into a Class, we opt to return the state_dict with every batch,
@@ -24,39 +25,67 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
 
     # infinite iterator over document batches (list of text strings)
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    BATCH_SIZE = 1024  # number of documents per batch (similar to parquet row_groups)
+
     def document_batches():
-        parquet_paths = list_parquet_files()
-        assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-        parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+        jsonl_paths = list_parquet_files()
+        assert len(jsonl_paths) != 0, "No dataset jsonl files found, did you run dataset.py?"
+        jsonl_paths = jsonl_paths[:-1] if split == "train" else jsonl_paths[-1:]
         resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
         resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
         first_pass = True
-        pq_idx = resume_pq_idx # we kick off parquet files at the resume index (or by default just 0)
+        pq_idx = resume_pq_idx # we kick off jsonl files at the resume index (or by default just 0)
         while True: # iterate infinitely (multi-epoch)
             pq_idx = resume_pq_idx if first_pass else 0
-            while pq_idx < len(parquet_paths): # iterate over all parquet files
-                filepath = parquet_paths[pq_idx]
-                pf = pq.ParquetFile(filepath)
-                # Start from resume point if resuming on same file, otherwise from DDP rank
-                # I know this state resumption is a little bit tricky and a little bit hacky... sigh.
-                if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                    base_idx = resume_rg_idx // ddp_world_size # in units of ddp_world_size
-                    base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
-                    rg_idx = base_idx * ddp_world_size + ddp_rank
-                    if rg_idx >= pf.num_row_groups:
-                        pq_idx += 1
-                        continue
-                    resume_rg_idx = None # set to None as we only want to do this a single time
-                else:
-                    rg_idx = ddp_rank
-                while rg_idx < pf.num_row_groups:
-                    rg = pf.read_row_group(rg_idx)
-                    batch = rg.column('text').to_pylist() # each batch is a parquet group, e.g. 1024 rows
-                    # the tokenizer encode might want to go in even smaller batches, e.g. 128 rows
-                    for i in range(0, len(batch), tokenizer_batch_size):
-                        yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx)
-                    rg_idx += ddp_world_size # advance to the next row group (in DDP)
-                pq_idx += 1 # advance to the next parquet file
+            while pq_idx < len(jsonl_paths): # iterate over all jsonl files
+                filepath = jsonl_paths[pq_idx]
+
+                # Determine if file is gzipped
+                is_gzipped = filepath.endswith('.gz')
+                open_fn = gzip.open if is_gzipped else open
+                mode = 'rt' if is_gzipped else 'r'
+
+                # Read and batch the jsonl file
+                with open_fn(filepath, mode, encoding='utf-8') as f:
+                    # Count total batches for this file
+                    # Start from resume point if resuming on same file, otherwise from DDP rank
+                    if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
+                        base_idx = resume_rg_idx // ddp_world_size # in units of ddp_world_size
+                        base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
+                        rg_idx = base_idx * ddp_world_size + ddp_rank
+                        resume_rg_idx = None # set to None as we only want to do this a single time
+                    else:
+                        rg_idx = ddp_rank
+
+                    batch = []
+                    batch_idx = 0
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            doc = json.loads(line)
+                            batch.append(doc['text'])
+
+                            # When we've accumulated BATCH_SIZE documents, process this batch
+                            if len(batch) >= BATCH_SIZE:
+                                # Check if this is a batch we should process (DDP)
+                                if batch_idx >= rg_idx and (batch_idx - rg_idx) % ddp_world_size == 0:
+                                    # the tokenizer encode might want to go in even smaller batches, e.g. 128 rows
+                                    for i in range(0, len(batch), tokenizer_batch_size):
+                                        yield batch[i:i+tokenizer_batch_size], (pq_idx, batch_idx)
+                                batch = []
+                                batch_idx += 1
+                        except (json.JSONDecodeError, KeyError):
+                            # Skip malformed lines
+                            continue
+
+                    # Process any remaining documents in the last batch
+                    if batch and batch_idx >= rg_idx and (batch_idx - rg_idx) % ddp_world_size == 0:
+                        for i in range(0, len(batch), tokenizer_batch_size):
+                            yield batch[i:i+tokenizer_batch_size], (pq_idx, batch_idx)
+
+                pq_idx += 1 # advance to the next jsonl file
             first_pass = False
     batches = document_batches()
 

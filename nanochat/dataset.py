@@ -1,7 +1,7 @@
 """
-The base/pretraining dataset is a set of parquet files.
+The base/pretraining dataset is a set of jsonl files (optionally gzipped).
 This file contains utilities for:
-- iterating over the parquet files and yielding documents from it
+- iterating over the jsonl files and yielding documents from it
 - download the files on demand if they are not on disk
 
 For details of how the dataset was prepared, see `repackage_data_reference.py`.
@@ -11,7 +11,8 @@ import os
 import argparse
 import time
 import requests
-import pyarrow.parquet as pq
+import json
+import gzip
 from multiprocessing import Pool
 
 from nanochat.common import get_base_dir
@@ -20,9 +21,9 @@ from nanochat.common import get_base_dir
 # The specifics of the current pretraining dataset
 
 # The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
-MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+BASE_URL = "https://huggingface.co/datasets/common-pile/pre_1929_books/resolve/main/data/documents"
+MAX_SHARD = 99 # adjust this based on the actual number of shards available
+index_to_filename = lambda index: f"{index:05d}_public_library_1929.jsonl.gz" # format of the filenames
 base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -31,30 +32,59 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # These functions are useful utilities to other modules, can/should be imported
 
 def list_parquet_files(data_dir=None):
-    """ Looks into a data dir and returns full paths to all parquet files. """
+    """ Looks into a data dir and returns full paths to all jsonl files.
+    Name kept as list_parquet_files for backward compatibility. """
     data_dir = DATA_DIR if data_dir is None else data_dir
-    parquet_files = sorted([
+    jsonl_files = sorted([
         f for f in os.listdir(data_dir)
-        if f.endswith('.parquet') and not f.endswith('.tmp')
+        if (f.endswith('.jsonl') or f.endswith('.jsonl.gz')) and not f.endswith('.tmp')
     ])
-    parquet_paths = [os.path.join(data_dir, f) for f in parquet_files]
-    return parquet_paths
+    jsonl_paths = [os.path.join(data_dir, f) for f in jsonl_files]
+    return jsonl_paths
 
-def parquets_iter_batched(split, start=0, step=1):
+def parquets_iter_batched(split, start=0, step=1, batch_size=1024):
     """
-    Iterate through the dataset, in batches of underlying row_groups for efficiency.
-    - split can be "train" or "val". the last parquet file will be val.
-    - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
+    Iterate through the dataset, in batches for efficiency.
+    - split can be "train" or "val". the last jsonl file will be val.
+    - start/step are useful for skipping batches in DDP. e.g. start=rank, step=world_size
+    - batch_size: number of documents per batch (default 1024, similar to parquet row_groups)
+    Name kept as parquets_iter_batched for backward compatibility.
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
-    parquet_paths = list_parquet_files()
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(start, pf.num_row_groups, step):
-            rg = pf.read_row_group(rg_idx)
-            texts = rg.column('text').to_pylist()
-            yield texts
+    jsonl_paths = list_parquet_files()
+    jsonl_paths = jsonl_paths[:-1] if split == "train" else jsonl_paths[-1:]
+
+    for filepath in jsonl_paths:
+        # Determine if file is gzipped
+        is_gzipped = filepath.endswith('.gz')
+        open_fn = gzip.open if is_gzipped else open
+        mode = 'rt' if is_gzipped else 'r'
+
+        # Read all lines from the file and batch them
+        with open_fn(filepath, mode, encoding='utf-8') as f:
+            batch = []
+            batch_idx = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                    batch.append(doc['text'])
+
+                    # When we've accumulated batch_size documents, yield if it's our turn (DDP)
+                    if len(batch) >= batch_size:
+                        if batch_idx >= start and (batch_idx - start) % step == 0:
+                            yield batch
+                        batch = []
+                        batch_idx += 1
+                except (json.JSONDecodeError, KeyError) as e:
+                    # Skip malformed lines
+                    continue
+
+            # Yield any remaining documents in the last batch
+            if batch and batch_idx >= start and (batch_idx - start) % step == 0:
+                yield batch
 
 # -----------------------------------------------------------------------------
 def download_single_file(index):
@@ -110,7 +140,7 @@ def download_single_file(index):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download FineWeb-Edu 100BT dataset shards")
+    parser = argparse.ArgumentParser(description="Download pre-1929 Books dataset shards")
     parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of shards to download (default: -1), -1 = disable")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
     args = parser.parse_args()
